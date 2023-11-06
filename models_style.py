@@ -10,6 +10,7 @@ import commons
 import attentions
 import monotonic_align
 import unet
+from style_speech.StyleSpeech import StyleAdaptiveEncoder, MelStyleEncoder
 
 
 class DurationPredictor(nn.Module):
@@ -115,6 +116,14 @@ class TextEncoder(nn.Module):
             x_dp = torch.cat([torch.detach(x), g_exp], 1)
         else:
             x_dp = torch.detach(x)
+            
+        # mel_mask = torch.unsqueeze(commons.sequence_mask(
+        #     mel_lengths, mel_target.size(1)
+        # ), 1).to(x.dtype)
+        # style_vector = self.ms_encoder(mel_target, mel_mask)
+        
+        # x = self.sae_layer(x, style_vector)
+        # # style adaptive encoder
 
         x_m = self.proj_m(x) * x_mask
         if not self.mean_only:
@@ -204,6 +213,7 @@ class DiffusionGenerator(nn.Module):
                  filter_channels,
                  filter_channels_dp,
                  enc_out_channels,
+                 style_speech_config,
                  kernel_size=3,
                  n_heads=2,
                  n_layers_enc=6,
@@ -285,12 +295,15 @@ class DiffusionGenerator(nn.Module):
             beta_1=self.beta_1,
             N=self.N,
             T=self.T)
+        
+        self.sae_layer = StyleAdaptiveEncoder(style_speech_config)
+        self.ms_encoder = MelStyleEncoder(style_speech_config)
 
         if n_speakers > 1:
             self.emb_g = nn.Embedding(n_speakers, gin_channels)
             nn.init.uniform_(self.emb_g.weight, -0.1, 0.1)
 
-    def forward(self, x, x_lengths, y=None, y_lengths=None, g=None, gen=False, noise_scale=1., length_scale=1.):
+    def forward(self, x, x_lengths, mel_target, mel_lengths=None, y=None, y_lengths=None, g=None, gen=False, noise_scale=1., length_scale=1.):
         if g is not None:
             g = F.normalize(self.emb_g(g)).unsqueeze(-1)  # [b, h]
         x_m, x_logs, logw, x_mask = self.encoder(x, x_lengths, g=g)
@@ -306,6 +319,10 @@ class DiffusionGenerator(nn.Module):
         z_mask = torch.unsqueeze(commons.sequence_mask(
             y_lengths, y_max_length), 1).to(x_mask.dtype)
         attn_mask = torch.unsqueeze(x_mask, -1) * torch.unsqueeze(z_mask, 2)
+        
+        mel_mask = commons.get_mask_from_lengths(mel_lengths, mel_target.size(2)) if mel_lengths is not None else None
+        
+        style_vector = self.ms_encoder(mel_target.transpose(1, 2), mel_mask)
 
         if gen:
             attn = commons.generate_path(w_ceil.squeeze(
@@ -316,6 +333,8 @@ class DiffusionGenerator(nn.Module):
                 1, 2), x_logs.transpose(1, 2)).transpose(1, 2)
             logw_ = torch.log(1e-8 + torch.sum(attn, -1)) * x_mask
 
+            z_m = self.sae_layer(z_m.transpose(1, 2), style_vector).transpose(1, 2)
+            
             y = self.decoder(z_m, gen=True)
             return (y, z_m, z_logs, z_mask), (x_m, x_logs, x_mask), (attn, logw, logw_)
         else:
@@ -335,6 +354,9 @@ class DiffusionGenerator(nn.Module):
                     logp, attn_mask.squeeze(1)).unsqueeze(1).detach()
             z_m = torch.matmul(attn.squeeze(1).transpose(1, 2), x_m.transpose(
                 1, 2)).transpose(1, 2)  # [b, t', t], [b, t, d] -> [b, d, t']
+            
+            z_m = self.sae_layer(z_m.transpose(1, 2), style_vector).transpose(1, 2)
+            
             z_logs = torch.matmul(attn.squeeze(1).transpose(1, 2), x_logs.transpose(
                 1, 2)).transpose(1, 2)  # [b, t', t], [b, t, d] -> [b, d, t']
             logw_ = torch.log(1e-8 + torch.sum(attn, -1)) * x_mask
